@@ -33,12 +33,11 @@ with st.sidebar:
     model_choice = st.selectbox(
         "2. 選擇 AI 模型",
         [
-            "gemini-3.1-flash-lite", 
-            "gemini-1.5-flash", 
-            "gemini-1.5-pro"
+            "gemini-2.0-flash-lite-preview-02-05", # 這是目前最常見的 Lite 預覽版 ID
+            "gemini-1.5-flash-latest",            # 這是最穩定的 Flash 版本
+            "gemini-1.5-pro-latest"               # 這是最強大但速度稍慢的版本
         ],
-        index=0,
-        help="3.1 Flash Lite 是目前最快且適合排班的模型"
+        index=0
     )
     
     st.divider()
@@ -123,3 +122,4 @@ with col2:
 # --- 4. 頁尾 ---
 st.divider()
 st.center = st.caption("© 2026 客服中心排班助手 | Vibe Coding Powered by Gemini")
+
