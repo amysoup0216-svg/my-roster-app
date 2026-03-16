@@ -2,9 +2,10 @@ import streamlit as st
 import google.generativeai as genai
 import pandas as pd
 import io
+import re # 新增：用來精準抓取 AI 回傳的 CSV 區塊
 
-# --- 1. 網頁配置 (簡約白風格) ---
-st.set_page_config(page_title="客服排班系統 - 模組 A", layout="wide", page_icon="⚙️")
+# --- 1. 網頁配置 ---
+st.set_page_config(page_title="客服排班系統 - 模組 A", layout="wide", page_icon="🧠")
 
 st.markdown("""
     <style>
@@ -19,56 +20,58 @@ with st.sidebar:
     st.title("⚙️ 核心設定")
     api_key = st.text_input("1. 輸入 Gemini API Key", type="password")
     
-    # 加入下拉選單，預設使用 Flash 避免 429 錯誤，但也保留你要的 Lite 與 Pro
-    st.markdown("### 🤖 模型選擇")
     model_choice = st.selectbox(
         "請選擇運算模型",
         [
-            "models/gemini-1.5-flash",
             "models/gemini-3.1-flash-lite-preview",
-            "models/gemini-3-pro-preview",
-            "models/gemini-1.5-pro-latest"
+            "models/gemini-1.5-flash",
+            "models/gemini-3-pro-preview"
         ],
-        index=0,
-        help="遇到 429 額度超限時，請確保選擇 flash 系列模型。"
+        index=0
     )
-    
     st.divider()
-    st.success("🛡️ 啟動『程式級防護』：100% 保留原始預劃假單。")
+    st.success("🛡️ 啟動『CoT 思考鏈』與『絕對鎖定防護』")
 
 # --- 3. 主要內容區域 ---
-st.title("🚀 模組 A：休假自動生成 (防篡改版)")
-st.write("上傳營運 Excel，AI 將自動補足 DO。**系統已加入強制鎖定機制，原始預劃假單絕對不會被更改。**")
+st.title("🚀 模組 A：休假自動生成 (精準思考版)")
+st.write("已啟用 AI 邏輯推演功能。系統會強迫 AI 先計算 ISO 週次與缺額，再生成班表。")
 
 # --- 4. 檔案上傳 ---
 uploaded_file = st.file_uploader("📂 請上傳人員資料 Excel (.xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
     try:
-        # 讀取原始 Excel
+        # 讀取並強制將所有欄位名稱轉為純文字 (解決日期格式對齊失敗的問題)
         df_original = pd.read_excel(uploaded_file)
-        st.subheader("📊 匯入資料預覽 (此資料將被鎖定保護)")
+        df_original.columns = df_original.columns.astype(str)
+        
+        st.subheader("📊 原始資料 (將作為防護基準)")
         st.dataframe(df_original, use_container_width=True)
         
         input_data_text = df_original.to_csv(index=False)
 
-        # --- 核心規則 ---
+        # --- 核心規則 (加入 CoT 思考鏈引導) ---
         prompt_rules = """
-你是一個專業的自動化排班演算法專家。請根據以下資料執行『模組 A：休假生成』。
-【最高指令】：絕對禁止刪除或修改資料中原有的假項 (AL/DO)，你只能在空白處補上 DO。
+你是一個專業的自動化排班演算法專家。
+【最高指令】：絕對禁止刪除或修改資料中原有的假項 (AL/DO)！你只能在「空白處」補上 DO。標題列的日期格式請一字不漏地照抄。
 
 ### 核心規則
 1. 每週 2 天 DO：依據 ISO 8601 (週一至週日)，每人每週必須有剛好 2 天 DO (包含預劃假單內的)。
 2. 避免過勞：不可連續工作超過 5 天 (滑動窗口 6 天內必有 1 天休假)。
 3. 每日上限：全組每天總休假人數 (AL+DO) 不可超過 3 人。
-4. 人員互斥：AAA07201 與 AAA07203 不可同日休假。
+4. 人員互斥：TPP07201 與 TPP07203 不可同日休假。
 
-### 輸出規範
-請直接回傳 CSV 內容，不要有任何 Markdown 標記或多餘文字。
-格式：姓名,代號,日期1,日期2,日期3...
+### 執行與輸出要求 (非常重要)
+請你分兩個階段回答：
+【第一階段：推演思考】
+請簡短寫下你對每位員工每一週 (週一到週日) 的缺額計算，以及你要把 DO 補在哪幾天的規劃。確認是否符合避免過勞規則。
+
+【第二階段：最終表格】
+思考完畢後，請務必將最終的 CSV 表格內容包覆在 ```csv 和 ``` 之間。
+請確保欄位數量與輸入資料完全一致！
 """
 
-        if st.button("✨ 開始自動補足休假 (DO)"):
+        if st.button("✨ 開始深度運算與補假"):
             if not api_key:
                 st.error("❌ 請輸入 API Key")
             else:
@@ -76,63 +79,65 @@ if uploaded_file is not None:
                     genai.configure(api_key=api_key)
                     model = genai.GenerativeModel(model_name=model_choice)
                     
-                    with st.spinner(f'🤖 使用 {model_choice} 運算中，請稍候...'):
+                    with st.spinner(f'🧠 AI 正在進行週次推演與計算 (可能需要幾秒鐘)...'):
                         full_prompt = f"{prompt_rules}\n\n【輸入資料】\n{input_data_text}"
                         response = model.generate_content(full_prompt)
+                        raw_text = response.text
                         
-                        # 解析 CSV
-                        raw_text = response.text.strip()
-                        clean_lines = [l.strip() for l in raw_text.split('\n') if ',' in l and not l.startswith('```')]
-                        result_csv = '\n'.join(clean_lines)
+                        # 展示 AI 的思考過程給主管看
+                        with st.expander("查看 AI 的邏輯推演過程 (點擊展開)"):
+                            st.write(raw_text)
                         
-                        # AI 產出的 DataFrame
+                        # --- 精準擷取 CSV 區塊 ---
+                        match = re.search(r'```csv\n(.*?)\n```', raw_text, re.DOTALL | re.IGNORECASE)
+                        if match:
+                            result_csv = match.group(1).strip()
+                        else:
+                            # 備用擷取法：如果 AI 忘記加標記，硬抓包含逗號的行
+                            clean_lines = [l.strip() for l in raw_text.split('\n') if ',' in l and not l.startswith('```')]
+                            result_csv = '\n'.join(clean_lines)
+                        
+                        # AI 產出的 DataFrame，並強制欄位為字串
                         df_ai = pd.read_csv(io.StringIO(result_csv), on_bad_lines='skip')
+                        df_ai.columns = df_ai.columns.astype(str)
                         
-                        # --- 🛡️ 程式級防護機制：強制覆蓋 ---
-                        # 確保 AI 沒有亂改原始的 AL 或 DO
+                        # --- 🛡️ 絕對防護機制 (Update 覆蓋) ---
                         try:
-                            # 1. 備份原始資料並設定對齊基準 (代號)
                             df_safe = df_original.copy().set_index('代號')
                             df_ai_indexed = df_ai.set_index('代號')
                             
-                            # 2. 將原始資料中「非空白」的欄位，強制覆蓋回 AI 的結果上
-                            df_ai_indexed.update(df_safe)
+                            # 確保兩邊欄位名稱完全一致再進行覆蓋
+                            common_cols = df_safe.columns.intersection(df_ai_indexed.columns)
+                            df_ai_indexed[common_cols].update(df_safe[common_cols])
                             
-                            # 3. 重設 Index 完成修復
                             df_final = df_ai_indexed.reset_index()
                             
-                            # 確保姓名欄位沒被亂改
-                            if '姓名' in df_original.columns:
-                                df_final['姓名'] = df_original['姓名'].values
-                                
-                            # 整理欄位順序，把姓名放回第一欄
+                            # 整理欄位順序
                             cols = ['姓名', '代號'] + [c for c in df_final.columns if c not in ['姓名', '代號']]
                             df_final = df_final[cols]
+                            st.success("🎉 運算與防護覆蓋完成！")
                             
                         except Exception as e:
-                            st.warning(f"防護機制警告：欄位對齊出現誤差，將直接顯示 AI 原始結果。({e})")
+                            st.warning(f"防護機制警告，可能部分日期格式不一致：{e}")
                             df_final = df_ai
                         
-                        st.success("🎉 休假表生成完畢！(已套用防篡改鎖定)")
-                        st.subheader("🗓️ 最終結果預覽")
+                        st.subheader("🗓️ 最終精準結果預覽")
                         st.dataframe(df_final, use_container_width=True)
                         
-                        # 下載功能
+                        # 下載
                         buffer = io.BytesIO()
                         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                            df_final.to_excel(writer, index=False, sheet_name='精準補假表')
+                            df_final.to_excel(writer, index=False, sheet_name='AI精準補假表')
                         
                         st.download_button(
-                            label="📥 下載最終版 Excel 班表",
+                            label="📥 下載最終安全版 Excel",
                             data=buffer.getvalue(),
-                            file_name="AI_Generated_DO_Table_Secured.xlsx",
+                            file_name="Secured_DO_Table.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
                         
                 except Exception as e:
-                    st.error(f"❌ 運算過程發生錯誤：{str(e)}")
+                    st.error(f"❌ 發生錯誤：{str(e)}")
 
     except Exception as e:
         st.error(f"❌ 讀取 Excel 失敗：{str(e)}")
-else:
-    st.info("👋 請上傳營運 Excel 檔案開始作業。")
