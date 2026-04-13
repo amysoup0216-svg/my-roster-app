@@ -7,7 +7,6 @@ import re
 # --- 1. 系統初始化與快取設定 ---
 st.set_page_config(page_title="網訊 (Telexpress) 智能排班系統", layout="wide", page_icon="📅")
 
-# 初始化系統暫存空間 (讓 A -> B -> C 資料流動)
 if 'system_cache_df' not in st.session_state:
     st.session_state.system_cache_df = None
 
@@ -20,87 +19,111 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. 側邊欄：導航與設定 ---
 with st.sidebar:
     st.title("⚙️ Telexpress 排班系統")
-    current_module = st.radio(
-        "📍 選擇作業模組",
-        ["模組 A：休假生成 (DO)", "模組 B：休假檢核", "模組 C：一鍵排班"]
-    )
-    
+    current_module = st.radio("📍 選擇作業模組", ["模組 A：休假生成 (DO)", "模組 B：休假檢核", "模組 C：一鍵排班"])
     st.divider()
     api_key = st.text_input("🔑 輸入 Gemini API Key", type="password")
-    model_choice = st.selectbox(
-        "🤖 選擇運算模型",
-        ["models/gemini-3.1-flash-lite-preview", "models/gemini-1.5-flash", "models/gemini-3-pro-preview"],
-        index=0
-    )
-    
+    model_choice = st.selectbox("🤖 選擇運算模型", ["models/gemini-1.5-pro", "models/gemini-1.5-flash"], index=0)
     if st.session_state.system_cache_df is not None:
-        st.success("💾 系統已備有暫存班表資料")
-        if st.button("🗑️ 清除暫存"):
+        if st.button("🗑️ 清除暫存資料"):
             st.session_state.system_cache_df = None
             st.rerun()
 
-# --- 3. 模組內容路由 ---
-
 # ==========================================
-# 🚀 模組 A：休假自動生成 (座標填空法)
+# 🚀 模組 A：休假自動生成 (座標填空法 - 強化版)
 # ==========================================
 if current_module == "模組 A：休假生成 (DO)":
     st.title("🚀 模組 A：休假自動生成")
-    st.write("上傳預排假單，系統將自動補足 DO。完成後將自動暫存，供後續模組使用。")
+    st.write("上傳預排假單，系統將自動計算並補足 DO。")
     
     uploaded_file_a = st.file_uploader("📂 上傳人員資料 Excel (.xlsx)", type=["xlsx"], key="file_a")
     
     if uploaded_file_a:
         df_a = pd.read_excel(uploaded_file_a)
-        df_a.columns = df_a.columns.astype(str)
+        # 強制清理所有欄位標題與內容的空白
+        df_a.columns = [str(c).strip() for c in df_a.columns]
         st.subheader("📊 原始資料預覽")
         st.dataframe(df_a, use_container_width=True)
         
+        # 升級後的 Prompt：強調日期格式與 CSV 結構
         prompt_rules_a = """
-        你是自動排班專家。請依據 ISO 週次(週一至週日)，為每人每週補足剛好 2 天 DO。
-        不可連續工作超過 5 天。每日休假人數(AL+DO)不可超過 3 人。TPP07201 與 TPP07203 不可同日休假。
-        請只回傳需要「新增 DO」的座標清單，格式為 CSV：代號,新增日期
-        (日期請用原始格式如 2026-01-05，包裹在 ```csv 標籤內)
+        你是自動排班專家。請依據以下規則計算：
+        1. 每人每週(週一至週日)必須有剛好 2 天 DO (包含原本已有的)。
+        2. 不可連續工作超過 5 天。
+        3. 每日全組休假人數(AL+DO)上限為 3 人。
+        4. AAA07201 與 AAA07203 不可同日休假。
+
+        請「只」輸出需要新增的 DO 座標，格式嚴格如下(包裹在 ```csv 內)：
+        ```csv
+        代號,新增日期
+        TPP07201,2026-01-05
+        TPP07202,2026-01-06
+        ```
+        注意：日期格式必須與輸入資料一致(如 2026-01-01)，不要包含星期幾。
         """
         
         if st.button("✨ 執行補假 (模組 A)"):
             if not api_key: st.error("請輸入 API Key")
             else:
-                with st.spinner('計算補假座標中...'):
+                with st.spinner('AI 正在計算補假座標中...'):
                     try:
                         genai.configure(api_key=api_key)
                         model = genai.GenerativeModel(model_name=model_choice)
-                        # 輔助 AI 辨識日期
+                        
+                        # 幫 AI 加上星期標籤輔助計算
                         df_ai_input = df_a.copy()
-                        df_ai_input.columns = [f"{col} ({['一','二','三','四','五','六','日'][pd.to_datetime(col).weekday()]})" if '-' in col else col for col in df_ai_input.columns]
+                        new_cols_ai = []
+                        for col in df_ai_input.columns:
+                            try:
+                                dt = pd.to_datetime(col)
+                                wk = ["一","二","三","四","五","六","日"][dt.weekday()]
+                                new_cols_ai.append(f"{col}({wk})")
+                            except: new_cols_ai.append(col)
+                        df_ai_input.columns = new_cols_ai
                         
                         response = model.generate_content(f"{prompt_rules_a}\n\n【輸入資料】\n{df_ai_input.to_csv(index=False)}")
                         
-                        match = re.search(r'```csv\n(.*?)\n```', response.text, re.DOTALL | re.IGNORECASE)
-                        csv_content = match.group(1).strip() if match else response.text
-                        clean_lines = [l.strip() for l in csv_content.split('\n') if ',' in l and '新增日期' not in l]
+                        # 解析 CSV
+                        res_text = response.text
+                        csv_match = re.search(r'```csv\n(.*?)\n```', res_text, re.DOTALL | re.IGNORECASE)
+                        csv_data = csv_match.group(1).strip() if csv_match else ""
                         
-                        df_final_a = df_a.copy()
-                        success_count = 0
-                        for line in clean_lines:
-                            try:
-                                emp_id, date_str = line.split(',')
-                                emp_id = emp_id.strip(); date_str = date_str.strip()
-                                row_idx = df_final_a.index[df_final_a['代號'] == emp_id].tolist()
-                                if row_idx and date_str in df_final_a.columns:
-                                    r = row_idx[0]
-                                    if pd.isna(df_final_a.at[r, date_str]) or str(df_final_a.at[r, date_str]).strip() == '':
-                                        df_final_a.at[r, date_str] = 'DO'
-                                        success_count += 1
-                            except: continue
-                        
-                        st.success(f"🎉 補假完成！新增了 {success_count} 個 DO。資料已暫存。")
-                        st.session_state.system_cache_df = df_final_a.copy()
-                        st.dataframe(df_final_a, use_container_width=True)
+                        if not csv_data:
+                            st.warning("AI 判定目前班表已符合規範，無需新增 DO。")
+                            st.expander("查看分析原文").text(res_text)
+                        else:
+                            df_final_a = df_a.copy()
+                            success_count = 0
+                            lines = csv_data.split('\n')
+                            
+                            for line in lines:
+                                if ',' in line and '代號' not in line:
+                                    parts = line.split(',')
+                                    emp_id = parts[0].strip()
+                                    date_val = parts[1].strip()
+                                    
+                                    # 強化比對邏輯：過濾代號與日期
+                                    row_mask = df_final_a['代號'].astype(str).str.strip() == emp_id
+                                    if row_mask.any() and date_val in df_final_a.columns:
+                                        r_idx = df_final_a.index[row_mask][0]
+                                        # 只有在空白格才填入
+                                        cell_val = str(df_final_a.at[r_idx, date_val]).strip().upper()
+                                        if cell_val in ['NAN', '', 'NONE']:
+                                            df_final_a.at[r_idx, date_val] = 'DO'
+                                            success_count += 1
+                            
+                            if success_count > 0:
+                                st.success(f"🎉 補假完成！成功新增 {success_count} 個 DO。資料已存入系統暫存。")
+                                st.session_state.system_cache_df = df_final_a.copy()
+                                st.dataframe(df_final_a, use_container_width=True)
+                            else:
+                                st.error("❌ 雖然 AI 產出了座標，但系統比對失敗（可能是日期格式不符）。")
+                                with st.expander("查看 AI 產出的原始座標"):
+                                    st.text(csv_data)
+
                     except Exception as e: st.error(f"錯誤：{e}")
+
 
 # ==========================================
 # ⚖️ 模組 B：休假檢核 (防呆雷達)
